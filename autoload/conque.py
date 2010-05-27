@@ -136,11 +136,12 @@ CONQUE_FONT = {
 # }}}
 
 # regular expression matching (almost) all control sequences
-CONQUE_SEQ_REGEX      = re.compile(ur"(\u001b\[?\??#?[0-9;]*[a-zA-Z@]|[\u0007-\u000f])", re.UNICODE)
-CONQUE_SEQ_REGEX_CTL  = re.compile(ur"^[\u0007-\u000f]$", re.UNICODE)
-CONQUE_SEQ_REGEX_CSI  = re.compile(ur"^\u001b\[", re.UNICODE)
-CONQUE_SEQ_REGEX_HASH = re.compile(ur"^\u001b#", re.UNICODE)
-CONQUE_SEQ_REGEX_ESC  = re.compile(ur"^\u001b", re.UNICODE)
+CONQUE_SEQ_REGEX       = re.compile(ur"(\u001b\[?\??#?[0-9;]*[a-zA-Z@]|\u001b\][0-9];.*?\u0007|[\u0007-\u000f])", re.UNICODE)
+CONQUE_SEQ_REGEX_CTL   = re.compile(ur"^[\u0007-\u000f]$", re.UNICODE)
+CONQUE_SEQ_REGEX_CSI   = re.compile(ur"^\u001b\[", re.UNICODE)
+CONQUE_SEQ_REGEX_TITLE = re.compile(ur"^\u001b\]", re.UNICODE)
+CONQUE_SEQ_REGEX_HASH  = re.compile(ur"^\u001b#", re.UNICODE)
+CONQUE_SEQ_REGEX_ESC   = re.compile(ur"^\u001b", re.UNICODE)
 
 # match table output
 CONQUE_TABLE_OUTPUT   = re.compile("^\s*\|\s.*\s\|\s*$|^\s*\+[=+-]+\+\s*$")
@@ -153,7 +154,6 @@ class Conque:
     # CLASS PROPERTIES {{{ 
 
     # screen object
-    window          = None
     screen          = None
 
     # subprocess object
@@ -195,13 +195,12 @@ class Conque:
     unwrap_tables = True
 
     # wrap CUF/CUB around line breaks
-    wrap_cursor = True
+    wrap_cursor = False
 
     # }}}
 
     # constructor
     def __init__(self): # {{{
-        self.window = vim.current.window
         self.screen = ConqueScreen()
         # }}}
 
@@ -209,21 +208,17 @@ class Conque:
     def open(self, command, options): # {{{
 
         # int vars
-        self.columns = self.window.width
-        self.lines = self.window.height
-        self.working_columns = self.window.width
-        self.working_lines = self.window.height
-        self.bottom = self.window.height
+        self.columns = vim.current.window.width
+        self.lines = vim.current.window.height
+        self.working_columns = vim.current.window.width
+        self.working_lines = vim.current.window.height
+        self.bottom = vim.current.window.height
 
         # init color
         self.enable_colors = options['color']
 
         # init tabstops
-        for i in range(0, self.columns + 1):
-            if i % 8 == 0:
-                self.tabstops.append(True)
-            else:
-                self.tabstops.append(False)
+        self.init_tabstops()
 
         # open command
         self.proc = ConqueSubprocess()
@@ -233,6 +228,9 @@ class Conque:
     # write to pty
     def write(self, input): # {{{
         logging.debug('writing input ' + str(input))
+
+        # check if window size has changed
+        self.update_window_size()
 
         # write and read
         self.proc.write(input)
@@ -255,66 +253,78 @@ class Conque:
 
         chunks = CONQUE_SEQ_REGEX.split(output)
         logging.debug('ouput chunking took ' + str((time.time() - debug_profile_start) * 1000) + ' ms')
+        logging.debug(str(chunks))
 
         debug_profile_start = time.time()
-        for s in chunks:
-            if s == '':
-                continue
 
-            logging.debug(str(s) + '--------------------------------------------------------------')
-            logging.debug('chgs ' + str(self.color_changes))
-            logging.debug('at line ' + str(self.l) + ' column ' + str(self.c))
-            logging.debug('current: ' + self.screen[self.l])
+        # don't go through all the csi regex if length is one (no matches)
+        if len(chunks) == 1:
+            logging.debug('short circuit')
+            self.plain_text(chunks[0])
 
-            # Check for control character match {{{
-            if CONQUE_SEQ_REGEX_CTL.match(s[0]):
-                logging.debug('control match')
-                nr = ord(s[0])
-                if nr in CONQUE_CTL:
-                    getattr(self, 'ctl_' + CONQUE_CTL[nr])()
-                else:
-                    logging.debug('escape not found for ' + str(s))
-                    pass
-                # }}}
+        else:
+            for s in chunks:
+                if s == '':
+                    continue
 
-            # check for escape sequence match {{{
-            elif CONQUE_SEQ_REGEX_CSI.match(s):
-                logging.debug('csi match')
-                if s[-1] in CONQUE_ESCAPE:
-                    csi = self.parse_csi(s[2:])
-                    logging.debug(str(csi))
-                    getattr(self, 'csi_' + CONQUE_ESCAPE[s[-1]])(csi)
+                logging.debug(str(s) + '--------------------------------------------------------------')
+                logging.debug('chgs ' + str(self.color_changes))
+                logging.debug('at line ' + str(self.l) + ' column ' + str(self.c))
+                logging.debug('current: ' + self.screen[self.l])
+
+                # Check for control character match {{{
+                if CONQUE_SEQ_REGEX_CTL.match(s[0]):
+                    logging.debug('control match')
+                    nr = ord(s[0])
+                    if nr in CONQUE_CTL:
+                        getattr(self, 'ctl_' + CONQUE_CTL[nr])()
+                    else:
+                        logging.debug('escape not found for ' + str(s))
+                        pass
+                    # }}}
+
+                # check for escape sequence match {{{
+                elif CONQUE_SEQ_REGEX_CSI.match(s):
+                    logging.debug('csi match')
+                    if s[-1] in CONQUE_ESCAPE:
+                        csi = self.parse_csi(s[2:])
+                        logging.debug(str(csi))
+                        getattr(self, 'csi_' + CONQUE_ESCAPE[s[-1]])(csi)
+                    else:
+                        logging.debug('escape not found for ' + str(s))
+                        pass
+                    # }}}
+        
+                # check for title match {{{
+                elif CONQUE_SEQ_REGEX_TITLE.match(s):
+                    logging.debug('title match')
+                    self.change_title(s[2], s[4:-1])
+                    # }}}
+        
+                # check for hash match {{{
+                elif CONQUE_SEQ_REGEX_HASH.match(s):
+                    logging.debug('hash match')
+                    if s[-1] in CONQUE_ESCAPE_HASH:
+                        getattr(self, 'hash_' + CONQUE_ESCAPE_HASH[s[-1]])()
+                    else:
+                        logging.debug('escape not found for ' + str(s))
+                        pass
+                    # }}}
+                
+                # check for other escape match {{{
+                elif CONQUE_SEQ_REGEX_ESC.match(s):
+                    logging.debug('escape match')
+                    if s[-1] in CONQUE_ESCAPE_PLAIN:
+                        getattr(self, 'esc_' + CONQUE_ESCAPE_PLAIN[s[-1]])()
+                    else:
+                        logging.debug('escape not found for ' + str(s))
+                        pass
+                    # }}}
+                
+                # else process plain text {{{
                 else:
-                    logging.debug('escape not found for ' + str(s))
-                    pass
-                # }}}
-    
-            # check for hash match {{{
-            elif CONQUE_SEQ_REGEX_HASH.match(s):
-                logging.debug('hash match')
-                if s[-1] in CONQUE_ESCAPE_HASH:
-                    csi = self.parse_csi(s[2:])
-                    getattr(self, 'hash_' + CONQUE_ESCAPE_HASH[s[-1]])(csi)
-                else:
-                    logging.debug('escape not found for ' + str(s))
-                    pass
-                # }}}
-            
-            # check for other escape match {{{
-            elif CONQUE_SEQ_REGEX_ESC.match(s):
-                logging.debug('escape match')
-                if s[-1] in CONQUE_ESCAPE_PLAIN:
-                    csi = self.parse_csi(s[1:])
-                    getattr(self, 'esc_' + CONQUE_ESCAPE_PLAIN[s[-1]])(csi)
-                else:
-                    logging.debug('escape not found for ' + str(s))
-                    pass
-                # }}}
-            
-            # else process plain text {{{
-            else:
-                self.plain_text(s)
-                # }}}
+                    self.plain_text(s)
+                    # }}}
 
         # set cursor position
         self.screen.set_cursor(self.l, self.c)
@@ -327,7 +337,10 @@ class Conque:
     # for polling
     def auto_read(self): # {{{
         self.read(1)
-        vim.command('call feedkeys("\<F22>", "t")')
+        if self.c == 1:
+            vim.command('call feedkeys("\<F23>", "t")')
+        else:
+            vim.command('call feedkeys("\<F22>", "t")')
         self.screen.set_cursor(self.l, self.c)
     # }}}
 
@@ -357,7 +370,9 @@ class Conque:
                 self.apply_color(self.c, self.working_columns)
                 self.ctl_nl()
                 self.ctl_cr()
-                self.plain_text(input[ -1 * diff : ])
+                remaining = input[ -1 * diff : ]
+                logging.debug('remaining text: "' + remaining + '"')
+                self.plain_text(remaining)
             else:
                 self.screen[self.l] = current_line[ : self.c - 1] + input[ : -1 * diff - 1 ] + input[-1]
                 self.apply_color(self.c, self.working_columns)
@@ -377,12 +392,35 @@ class Conque:
             return
 
         real_line = self.screen.get_real_line(self.l)
-        unique_key = str(self.proc.pid)
 
-        # clear colors if we're starting at col 1
-        if start == 1 and self.color_history.has_key(real_line):
-            for syn_name in self.color_history[real_line]:
-                vim.command('syn clear ' + syn_name)
+        # check for previous overlapping coloration
+        logging.debug('start ' + str(start) + ' end ' + str(end))
+        to_del = []
+        if self.color_history.has_key(real_line):
+            for i in range(len(self.color_history[real_line])):
+                syn = self.color_history[real_line][i]
+                logging.debug('checking syn ' + str(syn))
+                if syn['start'] >= start and syn['start'] < end:
+                    logging.debug('first')
+                    vim.command('syn clear ' + syn['name'])
+                    to_del.append(i)
+                    # outside
+                    if syn['end'] > end:
+                        logging.debug('first.half')
+                        self.exec_highlight(real_line, end, syn['end'], syn['highlight'])
+                elif syn['end'] > start and syn['end'] <= end:
+                    logging.debug('second')
+                    vim.command('syn clear ' + syn['name'])
+                    to_del.append(i)
+                    # outside
+                    if syn['start'] < start:
+                        logging.debug('second.half')
+                        self.exec_highlight(real_line, syn['start'], start, syn['highlight'])
+
+        if len(to_del) > 0:
+            to_del.reverse()
+            for di in to_del:
+                del self.color_history[real_line][di]
 
         # if there are no new colors
         if len(self.color_changes) == 0:
@@ -392,8 +430,15 @@ class Conque:
         for attr in self.color_changes.keys():
             highlight = highlight + ' ' + attr + '=' + self.color_changes[attr]
 
+        # execute the highlight
+        self.exec_highlight(real_line, start, end, highlight)
+
+    def exec_highlight(self, real_line, start, end, highlight):
+        unique_key = str(self.proc.pid)
+
         syntax_name = 'EscapeSequenceAt_' + unique_key + '_' + str(self.l) + '_' + str(start) + '_' + str(len(self.color_history) + 1)
-        syntax_region = 'syntax match ' + syntax_name + ' /\%' + str(real_line) + 'l\%>' + str(start - 1) + 'c.*\%<' + str(end + 1) + 'c/ contains=ALL oneline'
+        syntax_options = ' contains=ALLBUT,ConqueString,MySQLString,MySQLKeyword oneline'
+        syntax_region = 'syntax match ' + syntax_name + ' /\%' + str(real_line) + 'l\%>' + str(start - 1) + 'c.*\%<' + str(end + 1) + 'c/' + syntax_options
         syntax_highlight = 'highlight ' + syntax_name + highlight
 
         vim.command(syntax_region)
@@ -403,7 +448,7 @@ class Conque:
         if not self.color_history.has_key(real_line):
             self.color_history[real_line] = []
 
-        self.color_history[real_line].append(syntax_name)
+        self.color_history[real_line].append({'name':syntax_name, 'start':start, 'end':end, 'highlight':highlight})
 
     # }}}
 
@@ -439,7 +484,7 @@ class Conque:
         ts = self.working_columns
 
         # check set tabstops
-        for i in range(self.c, self.working_columns):
+        for i in range(self.c, len(self.tabstops)):
             if self.tabstops[i]:
                 ts = i + 1
                 break
@@ -461,25 +506,37 @@ class Conque:
         if len(csi['vals']) == 0:
             csi['vals'] = [0]
 
-        for val in csi['vals']:
-            if CONQUE_FONT.has_key(val):
-                logging.debug('color ' + str(CONQUE_FONT[val]))
-                # ignore starting normal colors
-                if CONQUE_FONT[val]['normal'] and len(self.color_changes) == 0:
-                    logging.debug('a')
-                    continue
-                # clear color changes
-                elif CONQUE_FONT[val]['normal']:
-                    logging.debug('b')
-                    self.color_changes = {}
-                # save these color attributes for next plain_text() call
-                else:
-                    logging.debug('c')
-                    for attr in CONQUE_FONT[val]['attributes'].keys():
-                        if self.color_changes.has_key(attr) and (attr == 'cterm' or attr == 'gui'):
-                            self.color_changes[attr] += ',' + CONQUE_FONT[val]['attributes'][attr]
-                        else:
-                            self.color_changes[attr] = CONQUE_FONT[val]['attributes'][attr]
+        # 256 xterm color foreground
+        if len(csi['vals']) == 3 and csi['vals'][0] == 38 and csi['vals'][1] == 5:
+            self.color_changes['ctermfg'] = str(csi['vals'][2])
+            self.color_changes['guifg'] = '#' + self.xterm_to_rgb(csi['vals'][2])
+
+        # 256 xterm color background
+        elif len(csi['vals']) == 3 and csi['vals'][0] == 48 and csi['vals'][1] == 5:
+            self.color_changes['ctermbg'] = str(csi['vals'][2])
+            self.color_changes['guibg'] = '#' + self.xterm_to_rgb(csi['vals'][2])
+
+        # 16 colors
+        else:
+            for val in csi['vals']:
+                if CONQUE_FONT.has_key(val):
+                    logging.debug('color ' + str(CONQUE_FONT[val]))
+                    # ignore starting normal colors
+                    if CONQUE_FONT[val]['normal'] and len(self.color_changes) == 0:
+                        logging.debug('a')
+                        continue
+                    # clear color changes
+                    elif CONQUE_FONT[val]['normal']:
+                        logging.debug('b')
+                        self.color_changes = {}
+                    # save these color attributes for next plain_text() call
+                    else:
+                        logging.debug('c')
+                        for attr in CONQUE_FONT[val]['attributes'].keys():
+                            if self.color_changes.has_key(attr) and (attr == 'cterm' or attr == 'gui'):
+                                self.color_changes[attr] += ',' + CONQUE_FONT[val]['attributes'][attr]
+                            else:
+                                self.color_changes[attr] = CONQUE_FONT[val]['attributes'][attr]
         # }}}
 
     def csi_clear_line(self, csi): # {{{
@@ -508,8 +565,8 @@ class Conque:
         if csi['val'] == 2 or (csi['val'] == 0 and self.c == 1):
             real_line = self.screen.get_real_line(self.l)
             if self.color_history.has_key(real_line):
-                for syn_name in self.color_history[real_line]:
-                    vim.command('syn clear ' + syn_name)
+                for syn in self.color_history[real_line]:
+                    vim.command('syn clear ' + syn['name'])
 
         logging.debug(str(self.color_changes))
         logging.debug('new line: ' + self.screen[self.l])
@@ -592,8 +649,8 @@ class Conque:
             real_line = self.screen.get_real_line(self.l)
             for line in self.color_history.keys():
                 if line >= real_line:
-                    for syn_name in self.color_history[line]:
-                        vim.command('syn clear ' + syn_name)
+                    for syn in self.color_history[line]:
+                        vim.command('syn clear ' + syn['name'])
 
         self.color_changes = {}
         # }}}
@@ -631,7 +688,7 @@ class Conque:
             new_end = csi['vals'][1]
         else:
             new_start = 1
-            new_end = self.window.height
+            new_end = vim.current.window.height
 
         self.top = new_start
         self.bottom = new_end
@@ -701,23 +758,24 @@ class Conque:
     ###############################################################################################
     # ESC functions {{{
 
-    def esc_scroll_up(self, csi): # {{{
+    def esc_scroll_up(self): # {{{
         self.ctl_nl()
 
         self.color_changes = {}
         # }}}
 
-    def esc_next_line(self, csi): # {{{
+    def esc_next_line(self): # {{{
         self.ctl_nl()
         self.c = 1
         # }}}
 
-    def esc_set_tab(self, csi): # {{{
+    def esc_set_tab(self): # {{{
         logging.debug('set tab at ' + str(self.c))
-        self.tabstops[self.c - 1] = True
+        if self.c <= len(self.tabstops):
+            self.tabstops[self.c - 1] = True
         # }}}
 
-    def esc_scroll_down(self, csi): # {{{
+    def esc_scroll_down(self): # {{{
         if self.l == self.top:
             del self.screen[self.bottom]
             self.screen.insert(self.top, '')
@@ -732,7 +790,7 @@ class Conque:
     ###############################################################################################
     # HASH functions {{{
 
-    def hash_screen_alignment_test(self, csi): # {{{
+    def hash_screen_alignment_test(self): # {{{
         self.csi_clear_screen(self.parse_csi('2J'))
         self.working_lines = self.lines
         for l in range(1, self.lines + 1):
@@ -744,6 +802,13 @@ class Conque:
     ###############################################################################################
     # Random stuff {{{
 
+    def change_title(self, key, val):
+        logging.debug(key)
+        logging.debug(val)
+        if key == '0' or key == '2':
+            logging.debug('setting title to ' + re.escape(val))
+            vim.command('setlocal statusline=' + re.escape(val))
+
     def paste(self):
         self.write(vim.eval('@@'))
         self.read(50)
@@ -753,22 +818,32 @@ class Conque:
 
     def update_window_size(self):
         # resize if needed
-        if self.window.width != self.columns or self.window.height != self.lines:
+        if vim.current.window.width != self.columns or vim.current.window.height != self.lines:
 
             # reset all window size attributes to default
-            self.columns = self.window.width
-            self.lines = self.window.height
-            self.working_columns = self.window.width
-            self.working_lines = self.window.height
-            self.bottom = self.window.height
+            self.columns = vim.current.window.width
+            self.lines = vim.current.window.height
+            self.working_columns = vim.current.window.width
+            self.working_lines = vim.current.window.height
+            self.bottom = vim.current.window.height
 
             # reset screen object attributes
             self.l = self.screen.reset_size(self.l)
+
+            # reset tabstops
+            self.init_tabstops()
 
             logging.debug('signal window resize here ---')
 
             # signal process that screen size has changed
             self.proc.window_resize(self.lines, self.columns)
+
+    def init_tabstops(self):
+        for i in range(0, self.columns + 1):
+            if i % 8 == 0:
+                self.tabstops.append(True)
+            else:
+                self.tabstops.append(False)
 
     # }}}
 
@@ -790,8 +865,11 @@ class Conque:
         if full != '':
             vals = full.split(';')
             for val in vals:
+                logging.debug(val)
+                val = re.sub("\D", "", val)
+                logging.debug(val)
                 if val != '':
-                    attr['vals'].append(int(val.replace("^0*", "")))
+                    attr['vals'].append(int(val))
 
         if len(attr['vals']) == 1:
             attr['val'] = int(attr['vals'][0])
@@ -807,6 +885,25 @@ class Conque:
             return min
 
         return val
+        # }}}
+
+    def xterm_to_rgb(self, color_code): # {{{
+        if color_code < 16:
+            ascii_colors = ['000000', 'CD0000', '00CD00', 'CDCD00', '0000EE', 'CD00CD', '00CDCD', 'E5E5E5', 
+                   '7F7F7F', 'FF0000', '00FF00', 'FFFF00', '5C5CFF', 'FF00FF', '00FFFF', 'FFFFFF']
+            return ascii_colors[color_code]
+
+        elif color_code < 232:
+            cc = int(color_code) - 16
+
+            p1 = "%02x" % (math.floor(cc / 36) * (255/5))
+            p2 = "%02x" % (math.floor((cc % 36) / 6) * (255/5))
+            p3 = "%02x" % (math.floor(cc % 6) * (255/5))
+
+            return p1 + p2 + p3
+        else:
+            grey_tone = "%02x" % math.floor((255/24) * (color_code - 232))
+            return grey_tone + grey_tone + grey_tone
         # }}}
 
     # }}}
